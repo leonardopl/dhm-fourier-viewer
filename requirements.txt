@@ -1,4 +1,5 @@
 numpy==2.4.3
-pypylon==26.2.1
+harvesters>=1.4.0
+genicam>=1.2.0
 PySide6==6.10.2
 scipy==1.17.1

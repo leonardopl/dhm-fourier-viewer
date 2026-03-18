@@ -1,15 +1,15 @@
 """Real-time camera viewer with Fourier spectrum display for off-axis digital holographic microscopy (DHM).
 
-Uses the pypylon (Basler pylon) SDK.  Works with Basler cameras natively and
-with other GenICam-compliant cameras through third-party GenTL producers.
+Uses Harvesters (GenICam) for vendor-neutral camera acquisition via GenTL producers.
+Compatible with any GenICam-compliant camera (Basler, FLIR, Allied Vision, IDS, etc.).
 """
 
 import os
-os.environ["OMP_NUM_THREADS"] = "1"  # avoid OpenMP/Qt thread contention
 import sys
 import time
 import numpy as np
-from pypylon import pylon
+from harvesters.core import Harvester
+from genicam.gentl import TimeoutException
 from PySide6 import QtWidgets, QtGui, QtCore
 from PySide6.QtCore import QSettings
 import scipy.fft
@@ -125,9 +125,12 @@ class CameraViewer(QtWidgets.QWidget):
     SETTINGS_ORG = "irimas"
     SETTINGS_APP = "dhm-fourier-viewer"
 
-    def __init__(self, camera, parent=None):
+    def __init__(self, ia, harvester, model_name, parent=None):
         super().__init__(parent)
-        self.camera = camera
+        self.ia = ia
+        self.harvester = harvester
+        self.model_name = model_name
+        self.node_map = ia.remote_device.node_map
         self.label = QtWidgets.QLabel(self)
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.label.setMinimumSize(1, 1)
@@ -430,8 +433,7 @@ class CameraViewer(QtWidgets.QWidget):
         QtGui.QShortcut(QtGui.QKeySequence('S'), self, self.save_images)
 
         try:
-            self.camera.Open()
-            self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            self.ia.start()
         except Exception as e:
             print(f"Error starting camera: {e}")
             self.status_label.setText(f"Camera error: {e}")
@@ -454,10 +456,13 @@ class CameraViewer(QtWidgets.QWidget):
         if self.fourier_window:
             self.fourier_window.close()
             self.fourier_window = None
-        if self.camera.IsGrabbing():
-            self.camera.StopGrabbing()
-        if self.camera.IsOpen():
-            self.camera.Close()
+        try:
+            if self.ia.is_acquiring():
+                self.ia.stop()
+            self.ia.destroy()
+            self.harvester.reset()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def save_settings(self):
@@ -743,25 +748,21 @@ class CameraViewer(QtWidgets.QWidget):
             print(f"Configuration load failed: {e}")
 
     def update_frame(self):
-        if not self.camera.IsGrabbing():
+        if not self.ia.is_acquiring():
             self.timer.stop()
             self.status_label.setText("Camera stopped grabbing")
             return
 
         try:
-            grabResult = self.camera.RetrieveResult(500, pylon.TimeoutHandling_ThrowException)
-            if not grabResult.GrabSucceeded():
-                grabResult.Release()
-                return
-
-            img = grabResult.Array
-            if img.ndim > 2:
-                img = img[..., 0]
+            with self.ia.fetch(timeout=0.5) as buffer:
+                component = buffer.payload.components[0]
+                img = component.data.reshape(
+                    component.height, component.width).copy()
 
             # Sync exposure slider/spinbox with camera value during auto-exposure
             if self.auto_exp_check.isChecked():
                 try:
-                    curv = int(self.camera.ExposureTime.GetValue())
+                    curv = int(self.node_map.ExposureTime.value)
                     if curv != self.exp_spin.value():
                         self.exp_slider.blockSignals(True)
                         self.exp_spin.blockSignals(True)
@@ -789,8 +790,6 @@ class CameraViewer(QtWidgets.QWidget):
                 self._render_fourier(img)
 
             self._update_label_pixmap()
-            grabResult.Release()
-
 
             self._frame_count += 1
             now = time.monotonic()
@@ -801,7 +800,7 @@ class CameraViewer(QtWidgets.QWidget):
                 self._fps_time = now
                 self._update_status()
 
-        except pylon.TimeoutException:
+        except TimeoutException:
             pass
         except Exception as e:
             print(f"Frame error: {e}")
@@ -980,9 +979,9 @@ class CameraViewer(QtWidgets.QWidget):
 
     def _init_exposure_controls(self):
         try:
-            min_exp = int(self.camera.ExposureTime.GetMin())
-            max_exp = int(self.camera.ExposureTime.GetMax())
-            cur_exp = int(self.camera.ExposureTime.GetValue())
+            min_exp = int(self.node_map.ExposureTime.min)
+            max_exp = int(self.node_map.ExposureTime.max)
+            cur_exp = int(self.node_map.ExposureTime.value)
             self.exp_slider.blockSignals(True)
             self.exp_spin.blockSignals(True)
             self.exp_slider.setRange(min_exp, min(max_exp, 50000))
@@ -991,7 +990,7 @@ class CameraViewer(QtWidgets.QWidget):
             self.exp_spin.setValue(cur_exp)
             self.exp_slider.blockSignals(False)
             self.exp_spin.blockSignals(False)
-            is_auto = self.camera.ExposureAuto.GetValue() != 'Off'
+            is_auto = self.node_map.ExposureAuto.value != 'Off'
             self.auto_exp_check.setChecked(is_auto)
             self.exp_slider.setEnabled(not is_auto)
             self.exp_spin.setEnabled(not is_auto)
@@ -1003,7 +1002,7 @@ class CameraViewer(QtWidgets.QWidget):
         self.exp_spin.setValue(val)
         self.exp_spin.blockSignals(False)
         try:
-            self.camera.ExposureTime.SetValue(int(val))
+            self.node_map.ExposureTime.value = int(val)
         except Exception as e:
             print(f"Exposure set error: {e}")
 
@@ -1012,18 +1011,18 @@ class CameraViewer(QtWidgets.QWidget):
         self.exp_slider.setValue(min(val, self.exp_slider.maximum()))
         self.exp_slider.blockSignals(False)
         try:
-            self.camera.ExposureTime.SetValue(int(val))
+            self.node_map.ExposureTime.value = int(val)
         except Exception as e:
             print(f"Exposure set error: {e}")
 
     def toggle_exposure(self, checked):
         try:
             if checked:
-                self.camera.ExposureAuto.SetValue('Continuous')
+                self.node_map.ExposureAuto.value = 'Continuous'
                 self.exp_slider.setEnabled(False)
                 self.exp_spin.setEnabled(False)
             else:
-                self.camera.ExposureAuto.SetValue('Off')
+                self.node_map.ExposureAuto.value = 'Off'
                 self.exp_slider.setEnabled(True)
                 self.exp_spin.setEnabled(True)
         except Exception as e:
@@ -1269,10 +1268,7 @@ class CameraViewer(QtWidgets.QWidget):
     def _update_status(self):
         if time.monotonic() < self._status_msg_until:
             return
-        try:
-            model = self.camera.GetDeviceInfo().GetModelName()
-        except Exception:
-            model = "Unknown"
+        model = self.model_name or "Unknown"
 
         config_str = "config loaded" if self.config_loaded else "defaults"
         fft_str = " | Fourier on" if self.fourier_enabled else ""
@@ -1282,8 +1278,8 @@ class CameraViewer(QtWidgets.QWidget):
 
     def _set_initial_size(self):
         try:
-            cam_width = self.camera.Width.GetValue()
-            cam_height = self.camera.Height.GetValue()
+            cam_width = self.node_map.Width.value
+            cam_height = self.node_map.Height.value
         except Exception:
             cam_width = 1024
             cam_height = 1024
@@ -1306,25 +1302,54 @@ class CameraViewer(QtWidgets.QWidget):
         self.resize(win_width, win_height)
 
 
+def _find_cti_files():
+    """Discover GenTL producer (.cti) files from environment and CLI arguments."""
+    import argparse
+    import glob
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--cti', action='append', default=[],
+                        help='Path to a GenTL producer .cti file')
+    args, _ = parser.parse_known_args()
+
+    cti_files = list(args.cti)
+
+    for env_var in ('GENICAM_GENTL64_PATH', 'GENICAM_GENTL32_PATH'):
+        path = os.environ.get(env_var, '')
+        if path:
+            for directory in path.split(os.pathsep):
+                cti_files.extend(glob.glob(os.path.join(directory, '*.cti')))
+
+    return cti_files
+
+
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
 
     try:
-        tl_factory = pylon.TlFactory.GetInstance()
-        devices = tl_factory.EnumerateDevices()
-
-        if not devices:
+        h = Harvester()
+        cti_paths = _find_cti_files()
+        if not cti_paths:
             raise RuntimeError(
-                "No camera detected! Check the connection and, for non-Basler "
-                "cameras, ensure a GenTL producer is installed and "
-                "GENICAM_GENTL64_PATH is set."
+                "No GenTL producer (.cti) files found. Install a GenTL producer "
+                "(e.g. Basler pylon, FLIR Spinnaker, Allied Vision Vimba) and set "
+                "GENICAM_GENTL64_PATH, or pass --cti <path>."
+            )
+        for p in cti_paths:
+            h.add_file(p)
+        h.update()
+
+        if not h.device_info_list:
+            raise RuntimeError(
+                "No camera detected! Check the connection and ensure a GenTL "
+                "producer is installed and GENICAM_GENTL64_PATH is set."
             )
 
-        device_info = devices[0]
-        print(f"Found camera: {device_info.GetModelName()}")
-        cam = pylon.InstantCamera(tl_factory.CreateDevice(device_info))
+        model = h.device_info_list[0].model
+        print(f"Found camera: {model}")
+        ia = h.create(0)
 
-        viewer = CameraViewer(cam)
+        viewer = CameraViewer(ia, h, model)
         viewer.show()
 
         sys.exit(app.exec())

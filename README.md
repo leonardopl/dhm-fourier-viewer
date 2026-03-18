@@ -7,9 +7,10 @@ Displays the camera feed alongside its 2D Fourier magnitude spectrum.
 Overlay markers indicate the 0th-order (DC), +1 (real image), and −1
 (virtual image) diffraction orders.
 
-Built on pypylon (Python wrapper for the Basler pylon SDK) and PySide6. Other
-GenICam-compatible cameras can be used via vendor GenTL producers
-(`.cti` files).
+Built on [Harvesters](https://github.com/genicam/harvesters) (the GenICam
+committee's Python acquisition library) and PySide6. Works with any
+GenICam-compliant camera that has a GenTL producer (`.cti` file), including
+Basler, FLIR, Allied Vision, IDS, Ximea, etc.
 
 ## Features
 
@@ -58,15 +59,14 @@ off-axis DHM reconstruction geometry.
 ## Requirements
 
 - Python >= 3.10
-- pypylon
-  - `pip install pypylon` pulls the pylon runtime automatically
-- Basler USB3 / GigE cameras work out of the box
-  - For other GenICam cameras, install the vendor GenTL producer (`.cti`) and
-    point `GENICAM_GENTL64_PATH` to its directory.
-- **Linux USB3:** udev rules are needed
-  - Either install the
-    [Basler pylon SDK](https://www.baslerweb.com/en/downloads/software/)
-    or copy `/opt/pylon/share/pylon/69-basler-cameras.rules` manually.
+- A GenTL producer (`.cti` file) for your camera. Common sources:
+  - [Basler pylon SDK](https://www.baslerweb.com/en/downloads/software/)
+  - [FLIR Spinnaker SDK](https://www.flir.com/products/spinnaker-sdk/)
+  - [Allied Vision Vimba X](https://www.alliedvision.com/en/products/software/vimba-x-sdk/)
+- Set `GENICAM_GENTL64_PATH` to the directory containing the `.cti` file,
+  or pass `--cti <path>` on the command line.
+- **Linux USB3:** udev rules are typically needed for camera access
+  (e.g. install the Basler pylon SDK or copy the vendor-provided rules).
 - Only standard SFNC features (`ExposureTime`, `ExposureAuto`, `Width`,
   `Height`) are used.
 
