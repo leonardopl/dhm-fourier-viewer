@@ -5,6 +5,7 @@ Compatible with any GenICam-compliant camera (Basler, FLIR, Allied Vision, IDS, 
 """
 
 import os
+import re
 import sys
 import time
 import numpy as np
@@ -138,6 +139,7 @@ class CameraViewer(QtWidgets.QWidget):
 
         self._last_camera_image = None   # uint8 numpy array
         self._last_fourier_image = None  # uint8 numpy array
+        self._pixel_effective_max = 255  # effective max value for current pixel format
 
         self.dim_roi = 1024
         self.crop_x = 0
@@ -182,6 +184,10 @@ class CameraViewer(QtWidgets.QWidget):
         }
 
         self.pick_mode = False
+        self._draw_roi_mode = False
+        self._draw_roi_origin = None       # QPoint — drag start in label widget coords
+        self._rubber_band = None           # QRubberBand instance
+        self._pre_draw_roi_state = None    # (crop_enabled, dim_roi, crop_x, crop_y) for cancel
         self.fourier_enabled = False
         self.crop_enabled = True
         self.resample_enabled = False
@@ -236,6 +242,13 @@ class CameraViewer(QtWidgets.QWidget):
         self.exp_spin.setSuffix(" µs")
         self.exp_spin.valueChanged.connect(self.on_exp_spin_changed)
         controls.addWidget(self.exp_spin)
+
+        controls.addWidget(QtWidgets.QLabel('Fmt:'))
+        self.pixel_format_combo = QtWidgets.QComboBox()
+        self.pixel_format_combo.setToolTip('Pixel format / bit depth')
+        self.pixel_format_combo.setFixedWidth(100)
+        controls.addWidget(self.pixel_format_combo)
+
         controls.addStretch()
 
         layout.addLayout(controls)
@@ -250,10 +263,22 @@ class CameraViewer(QtWidgets.QWidget):
         self.roi_crop_check.toggled.connect(self.toggle_crop)
         crop_controls.addWidget(self.roi_crop_check)
 
+        # Query sensor limits for spinbox ranges
+        try:
+            self._sensor_w_max = self.node_map.WidthMax.value
+            self._sensor_h_max = self.node_map.HeightMax.value
+        except Exception:
+            self._sensor_w_max = 4096
+            self._sensor_h_max = 4096
+
+        w_inc = getattr(self.node_map.Width, 'inc', 64) or 64
+        ox_inc = getattr(self.node_map.OffsetX, 'inc', 64) or 64
+        oy_inc = getattr(self.node_map.OffsetY, 'inc', 64) or 64
+
         self.crop_size_spin = QtWidgets.QSpinBox()
-        self.crop_size_spin.setRange(64, 4096)
+        self.crop_size_spin.setRange(w_inc, min(self._sensor_w_max, self._sensor_h_max))
         self.crop_size_spin.setValue(self.dim_roi)
-        self.crop_size_spin.setSingleStep(64)
+        self.crop_size_spin.setSingleStep(w_inc)
         self.crop_size_spin.setFixedWidth(60)
         self.crop_size_spin.setToolTip('ROI size in pixels (DIM_ROI)')
         self.crop_size_spin.valueChanged.connect(self.on_crop_size_changed)
@@ -261,9 +286,9 @@ class CameraViewer(QtWidgets.QWidget):
 
         crop_controls.addWidget(QtWidgets.QLabel('X:'))
         self.crop_x_spin = QtWidgets.QSpinBox()
-        self.crop_x_spin.setRange(0, 4096)
+        self.crop_x_spin.setRange(0, self._sensor_w_max)
         self.crop_x_spin.setValue(self.crop_x)
-        self.crop_x_spin.setSingleStep(64)
+        self.crop_x_spin.setSingleStep(ox_inc)
         self.crop_x_spin.setFixedWidth(60)
         self.crop_x_spin.setToolTip('ROI crop X offset (px)')
         self.crop_x_spin.valueChanged.connect(self.on_crop_offset_changed)
@@ -271,13 +296,20 @@ class CameraViewer(QtWidgets.QWidget):
 
         crop_controls.addWidget(QtWidgets.QLabel('Y:'))
         self.crop_y_spin = QtWidgets.QSpinBox()
-        self.crop_y_spin.setRange(0, 4096)
+        self.crop_y_spin.setRange(0, self._sensor_h_max)
         self.crop_y_spin.setValue(self.crop_y)
-        self.crop_y_spin.setSingleStep(64)
+        self.crop_y_spin.setSingleStep(oy_inc)
         self.crop_y_spin.setFixedWidth(60)
         self.crop_y_spin.setToolTip('ROI crop Y offset (px)')
         self.crop_y_spin.valueChanged.connect(self.on_crop_offset_changed)
         crop_controls.addWidget(self.crop_y_spin)
+
+        self.draw_roi_btn = QtWidgets.QPushButton('Draw ROI')
+        self.draw_roi_btn.setCheckable(True)
+        self.draw_roi_btn.setFixedWidth(70)
+        self.draw_roi_btn.setToolTip('Draw ROI rectangle on the camera image (D)')
+        self.draw_roi_btn.toggled.connect(self._toggle_draw_roi_mode)
+        crop_controls.addWidget(self.draw_roi_btn)
 
         self.resample_check = QtWidgets.QCheckBox('Resample')
         self.resample_check.setChecked(False)
@@ -427,10 +459,13 @@ class CameraViewer(QtWidgets.QWidget):
 
         self.fourier_window = None
 
-        self.label.mousePressEvent = self.on_main_label_clicked
+        self.label.mousePressEvent = self._on_label_mouse_press
+        self.label.mouseMoveEvent = self._on_label_mouse_move
+        self.label.mouseReleaseEvent = self._on_label_mouse_release
 
         QtGui.QShortcut(QtGui.QKeySequence('F'), self, lambda: self.fourier_check.toggle())
         QtGui.QShortcut(QtGui.QKeySequence('S'), self, self.save_images)
+        QtGui.QShortcut(QtGui.QKeySequence('D'), self, lambda: self.draw_roi_btn.toggle())
 
         try:
             self.ia.start()
@@ -441,6 +476,8 @@ class CameraViewer(QtWidgets.QWidget):
 
         self.timer.start(30)
         self._init_exposure_controls()
+        self._init_pixel_format_control()
+        self._init_roi_controls()
         self._set_initial_size()
         self._update_status()
 
@@ -471,10 +508,6 @@ class CameraViewer(QtWidgets.QWidget):
         s.setValue('fourier_enabled', self.fourier_check.isChecked())
         s.setValue('detach', self.detach_check.isChecked())
         s.setValue('orders_visible', self.orders_check.isChecked())
-        s.setValue('crop_enabled', self.roi_crop_check.isChecked())
-        s.setValue('dim_roi', self.crop_size_spin.value())
-        s.setValue('crop_x', self.crop_x_spin.value())
-        s.setValue('crop_y', self.crop_y_spin.value())
         s.setValue('resample_enabled', self.resample_check.isChecked())
         s.setValue('resample_target', self.resample_spin.value())
         s.setValue('gamma', self.gamma_spin.value())
@@ -483,6 +516,7 @@ class CameraViewer(QtWidgets.QWidget):
         s.setValue('cx', self.cx_spin.value())
         s.setValue('cy', self.cy_spin.value())
         s.setValue('auto_calc', self.auto_calc_check.isChecked())
+        s.setValue('pixel_format', self.pixel_format_combo.currentText())
         s.setValue('geometry', self.saveGeometry())
         if self.fourier_window:
             s.setValue('fourier_window_geometry', self.fourier_window.saveGeometry())
@@ -499,8 +533,6 @@ class CameraViewer(QtWidgets.QWidget):
         widgets = [
             self.fourier_check,
             self.detach_check, self.orders_check,
-            self.roi_crop_check, self.crop_size_spin,
-            self.crop_x_spin, self.crop_y_spin,
             self.resample_check,
             self.resample_spin, self.gamma_slider, self.gamma_spin,
             self.clip_spin, self.nxmax_spin, self.cx_spin, self.cy_spin,
@@ -515,22 +547,6 @@ class CameraViewer(QtWidgets.QWidget):
 
         orders = s.value('orders_visible', 'true') != 'false'
         self.orders_check.setChecked(orders)
-
-        crop = s.value('crop_enabled', 'true') != 'false'
-        self.roi_crop_check.setChecked(crop)
-        self.crop_enabled = crop
-
-        dim_roi = int(s.value('dim_roi', self._defaults['dim_roi']))
-        self.crop_size_spin.setValue(dim_roi)
-        self.dim_roi = dim_roi
-
-        crop_x = int(s.value('crop_x', self._defaults['crop_x']))
-        self.crop_x_spin.setValue(crop_x)
-        self.crop_x = crop_x
-
-        crop_y = int(s.value('crop_y', self._defaults['crop_y']))
-        self.crop_y_spin.setValue(crop_y)
-        self.crop_y = crop_y
 
         resample = s.value('resample_enabled', 'false') == 'true'
         self.resample_check.setChecked(resample)
@@ -565,6 +581,13 @@ class CameraViewer(QtWidgets.QWidget):
         for w in widgets:
             w.blockSignals(False)
 
+        # Restore pixel format
+        saved_fmt = s.value('pixel_format', '')
+        if saved_fmt:
+            idx = self.pixel_format_combo.findText(saved_fmt)
+            if idx >= 0 and self.pixel_format_combo.currentText() != saved_fmt:
+                self.pixel_format_combo.setCurrentText(saved_fmt)
+
         # Enable/disable dependent widgets
         self.detach_check.setEnabled(fourier)
         self.orders_check.setEnabled(fourier and self.nxmax > 0)
@@ -595,8 +618,6 @@ class CameraViewer(QtWidgets.QWidget):
         widgets = [
             self.fourier_check,
             self.detach_check, self.orders_check,
-            self.roi_crop_check, self.crop_size_spin,
-            self.crop_x_spin, self.crop_y_spin,
             self.resample_check,
             self.resample_spin, self.gamma_slider, self.gamma_spin,
             self.clip_spin, self.nxmax_spin, self.cx_spin, self.cy_spin,
@@ -608,10 +629,6 @@ class CameraViewer(QtWidgets.QWidget):
         self.fourier_check.setChecked(d['fourier_enabled'])
         self.detach_check.setChecked(d['detach'])
         self.orders_check.setChecked(d['orders_visible'])
-        self.roi_crop_check.setChecked(d['crop_enabled'])
-        self.crop_size_spin.setValue(d['dim_roi'])
-        self.crop_x_spin.setValue(d['crop_x'])
-        self.crop_y_spin.setValue(d['crop_y'])
         self.resample_check.setChecked(d['resample_enabled'])
         self.resample_spin.setValue(d['resample_target'])
         self.gamma_spin.setValue(d['gamma'])
@@ -627,10 +644,6 @@ class CameraViewer(QtWidgets.QWidget):
 
         # Apply state from defaults
         self.fourier_enabled = d['fourier_enabled']
-        self.crop_enabled = d['crop_enabled']
-        self.dim_roi = d['dim_roi']
-        self.crop_x = d['crop_x']
-        self.crop_y = d['crop_y']
         self.resample_enabled = d['resample_enabled']
         self.nxmax = d['nxmax']
         self.cx = d['cx']
@@ -641,6 +654,32 @@ class CameraViewer(QtWidgets.QWidget):
         self.orders_check.setEnabled(d['fourier_enabled'] and d['nxmax'] > 0)
         self.resample_spin.setEnabled(d['resample_enabled'])
         self._update_nxmax_ui()
+
+        # Reset ROI (block signals to avoid multiple camera stop/start cycles)
+        self.roi_crop_check.blockSignals(True)
+        self.crop_size_spin.blockSignals(True)
+        self.crop_x_spin.blockSignals(True)
+        self.crop_y_spin.blockSignals(True)
+
+        self.roi_crop_check.setChecked(d['crop_enabled'])
+        self.crop_size_spin.setValue(d['dim_roi'])
+        self.crop_x_spin.setValue(d['crop_x'])
+        self.crop_y_spin.setValue(d['crop_y'])
+
+        self.roi_crop_check.blockSignals(False)
+        self.crop_size_spin.blockSignals(False)
+        self.crop_x_spin.blockSignals(False)
+        self.crop_y_spin.blockSignals(False)
+
+        self.crop_enabled = d['crop_enabled']
+        self.dim_roi = d['dim_roi']
+        self.crop_x = d['crop_x']
+        self.crop_y = d['crop_y']
+
+        if d['crop_enabled']:
+            self._apply_camera_roi(d['dim_roi'], d['dim_roi'], d['crop_x'], d['crop_y'])
+        else:
+            self._reset_camera_roi()
 
         # Close detached Fourier window if open
         if self.fourier_window:
@@ -772,9 +811,6 @@ class CameraViewer(QtWidgets.QWidget):
                         self.exp_spin.blockSignals(False)
                 except Exception as e:
                     print(f"Exposure sync error: {e}")
-
-            if self.crop_enabled:
-                img = self._apply_crop(img)
 
             if self.resample_enabled:
                 img = self._apply_resize(img)
@@ -935,10 +971,8 @@ class CameraViewer(QtWidgets.QWidget):
     def _normalize_image(self, img):
         if img.dtype == np.uint8:
             return img
-        if np.issubdtype(img.dtype, np.integer):
-            info = np.iinfo(img.dtype)
-            if info.max > 255:
-                return (img / info.max * 255).astype(np.uint8)
+        if np.issubdtype(img.dtype, np.integer) and self._pixel_effective_max > 255:
+            return (img * (255.0 / self._pixel_effective_max)).astype(np.uint8)
         return img.astype(np.uint8)
 
     def _get_fft_scale_factors(self, img_w, img_h):
@@ -948,19 +982,55 @@ class CameraViewer(QtWidgets.QWidget):
         # CX/CY are defined in DIM_ROI coordinates; use per-axis scaling for non-square FFTs.
         return img_w / self.dim_roi, img_h / self.dim_roi
 
-    def _apply_crop(self, img):
-        crop_size = self.dim_roi
-        h, w = img.shape[:2]
+    def _apply_camera_roi(self, width, height, offset_x, offset_y):
+        """Apply ROI at the camera level via GenICam node map."""
+        try:
+            # Read sensor limits
+            w_max = self.node_map.WidthMax.value
+            h_max = self.node_map.HeightMax.value
 
-        if h <= crop_size and w <= crop_size:
-            return img
+            # Round to valid increments if available
+            w_inc = getattr(self.node_map.Width, 'inc', 1) or 1
+            h_inc = getattr(self.node_map.Height, 'inc', 1) or 1
+            ox_inc = getattr(self.node_map.OffsetX, 'inc', 1) or 1
+            oy_inc = getattr(self.node_map.OffsetY, 'inc', 1) or 1
 
-        start_x = min(self.crop_x, max(0, w - crop_size))
-        start_y = min(self.crop_y, max(0, h - crop_size))
-        end_y = start_y + min(crop_size, h)
-        end_x = start_x + min(crop_size, w)
+            width = max(w_inc, (width // w_inc) * w_inc)
+            height = max(h_inc, (height // h_inc) * h_inc)
+            offset_x = (offset_x // ox_inc) * ox_inc
+            offset_y = (offset_y // oy_inc) * oy_inc
 
-        return img[start_y:end_y, start_x:end_x].copy()
+            # Clamp so offset + dimension doesn't exceed sensor
+            offset_x = max(0, min(offset_x, w_max - width))
+            offset_y = max(0, min(offset_y, h_max - height))
+            width = min(width, w_max - offset_x)
+            height = min(height, h_max - offset_y)
+
+            was_acquiring = self.ia.is_acquiring()
+            if was_acquiring:
+                self.ia.stop()
+
+            # Reset offsets first (GenICam requires this before shrinking dimensions)
+            self.node_map.OffsetX.value = 0
+            self.node_map.OffsetY.value = 0
+            self.node_map.Width.value = width
+            self.node_map.Height.value = height
+            self.node_map.OffsetX.value = offset_x
+            self.node_map.OffsetY.value = offset_y
+
+            if was_acquiring:
+                self.ia.start()
+        except Exception as e:
+            print(f"Camera ROI error: {e}")
+
+    def _reset_camera_roi(self):
+        """Reset camera to full sensor resolution."""
+        try:
+            w_max = self.node_map.WidthMax.value
+            h_max = self.node_map.HeightMax.value
+            self._apply_camera_roi(w_max, h_max, 0, 0)
+        except Exception as e:
+            print(f"Camera ROI reset error: {e}")
 
     def _apply_resize(self, img):
         target_size = self.resample_spin.value()
@@ -996,6 +1066,81 @@ class CameraViewer(QtWidgets.QWidget):
             self.exp_spin.setEnabled(not is_auto)
         except Exception as e:
             print(f"Exposure init error: {e}")
+
+    def _init_roi_controls(self):
+        """Read current ROI from camera and sync UI controls."""
+        try:
+            cur_w = self.node_map.Width.value
+            cur_h = self.node_map.Height.value
+            cur_ox = self.node_map.OffsetX.value
+            cur_oy = self.node_map.OffsetY.value
+
+            crop_enabled = (cur_w < self._sensor_w_max
+                            or cur_h < self._sensor_h_max)
+            dim_roi = min(cur_w, cur_h)
+
+            self.roi_crop_check.blockSignals(True)
+            self.crop_size_spin.blockSignals(True)
+            self.crop_x_spin.blockSignals(True)
+            self.crop_y_spin.blockSignals(True)
+
+            self.crop_enabled = crop_enabled
+            self.dim_roi = dim_roi
+            self.crop_x = cur_ox
+            self.crop_y = cur_oy
+
+            self.roi_crop_check.setChecked(crop_enabled)
+            self.crop_size_spin.setValue(dim_roi)
+            self.crop_x_spin.setValue(cur_ox)
+            self.crop_y_spin.setValue(cur_oy)
+
+            self.roi_crop_check.blockSignals(False)
+            self.crop_size_spin.blockSignals(False)
+            self.crop_x_spin.blockSignals(False)
+            self.crop_y_spin.blockSignals(False)
+        except Exception as e:
+            print(f"ROI init error: {e}")
+
+    def _init_pixel_format_control(self):
+        """Populate pixel format combo box from camera and connect signal."""
+        try:
+            available = self.node_map.PixelFormat.symbolics
+            current = self.node_map.PixelFormat.value
+            self.pixel_format_combo.blockSignals(True)
+            self.pixel_format_combo.clear()
+            for fmt in available:
+                self.pixel_format_combo.addItem(fmt)
+            idx = self.pixel_format_combo.findText(current)
+            if idx >= 0:
+                self.pixel_format_combo.setCurrentIndex(idx)
+            self.pixel_format_combo.blockSignals(False)
+            self.pixel_format_combo.currentTextChanged.connect(self.on_pixel_format_changed)
+            self._update_pixel_effective_max(current)
+        except Exception as e:
+            print(f"Pixel format init error: {e}")
+
+    def _update_pixel_effective_max(self, fmt_name):
+        m = re.search(r'(\d+)', fmt_name)
+        if m:
+            bits = int(m.group(1))
+            self._pixel_effective_max = (1 << bits) - 1
+        else:
+            self._pixel_effective_max = 255
+
+    def on_pixel_format_changed(self, text):
+        """Change camera pixel format, stopping/restarting acquisition."""
+        try:
+            was_acquiring = self.ia.is_acquiring()
+            if was_acquiring:
+                self.ia.stop()
+            self.node_map.PixelFormat.value = text
+            self._update_pixel_effective_max(text)
+            if was_acquiring:
+                self.ia.start()
+            self._show_status_message(f"Pixel format: {text}", 3)
+        except Exception as e:
+            print(f"Pixel format change error: {e}")
+            self._show_status_message(f"Pixel format error: {e}", 5)
 
     def on_exp_slider_changed(self, val):
         self.exp_spin.blockSignals(True)
@@ -1051,6 +1196,10 @@ class CameraViewer(QtWidgets.QWidget):
 
     def toggle_crop(self, checked):
         self.crop_enabled = checked
+        if checked:
+            self._apply_camera_roi(self.dim_roi, self.dim_roi, self.crop_x, self.crop_y)
+        else:
+            self._reset_camera_roi()
 
     def toggle_resample(self, checked):
         self.resample_enabled = checked
@@ -1058,12 +1207,16 @@ class CameraViewer(QtWidgets.QWidget):
 
     def on_crop_size_changed(self, value):
         self.dim_roi = value
+        if self.crop_enabled:
+            self._apply_camera_roi(self.dim_roi, self.dim_roi, self.crop_x, self.crop_y)
         if self.auto_calc_check.isChecked():
             self.calculate_all_theo()
 
     def on_crop_offset_changed(self):
         self.crop_x = self.crop_x_spin.value()
         self.crop_y = self.crop_y_spin.value()
+        if self.crop_enabled:
+            self._apply_camera_roi(self.dim_roi, self.dim_roi, self.crop_x, self.crop_y)
 
     def on_nxmax_changed(self, value):
         self.nxmax = value
@@ -1085,6 +1238,249 @@ class CameraViewer(QtWidgets.QWidget):
         self.cx_spin.blockSignals(False)
         self.cy_spin.blockSignals(False)
         self._sync_theo_combo_to_cxy()
+
+    # --- Draw ROI mode -----------------------------------------------------------
+
+    def _toggle_draw_roi_mode(self, checked):
+        """Enter or exit draw-ROI mode."""
+        if checked:
+            # Save current state for cancel/restore
+            self._pre_draw_roi_state = (
+                self.crop_enabled, self.dim_roi, self.crop_x, self.crop_y)
+            # Reset to full sensor so user sees the whole image
+            self._reset_camera_roi()
+            # Disable ROI spinboxes and pick mode while drawing
+            self.crop_size_spin.setEnabled(False)
+            self.crop_x_spin.setEnabled(False)
+            self.crop_y_spin.setEnabled(False)
+            self.roi_crop_check.setEnabled(False)
+            if self.pick_mode:
+                self.pick_mode_btn.setChecked(False)
+            self.pick_mode_btn.setEnabled(False)
+            self.label.setCursor(QtCore.Qt.CrossCursor)
+            self._show_status_message("Draw ROI: click and drag on the image. Right-click or Escape to cancel.", 0)
+        else:
+            # Exit draw mode
+            if self._rubber_band:
+                self._rubber_band.hide()
+            self._draw_roi_origin = None
+            self.crop_size_spin.setEnabled(True)
+            self.crop_x_spin.setEnabled(True)
+            self.crop_y_spin.setEnabled(True)
+            self.roi_crop_check.setEnabled(True)
+            self.pick_mode_btn.setEnabled(True)
+            self.label.setCursor(QtCore.Qt.ArrowCursor)
+            self._draw_roi_mode = False
+            self._update_status()
+        self._draw_roi_mode = checked
+
+    def _on_label_mouse_press(self, event):
+        """Unified mouse press: draw-ROI drag or pick-mode click."""
+        if self._draw_roi_mode:
+            if event.button() == QtCore.Qt.LeftButton:
+                self._draw_roi_origin = event.position().toPoint()
+                if self._rubber_band is None:
+                    self._rubber_band = QtWidgets.QRubberBand(
+                        QtWidgets.QRubberBand.Rectangle, self.label)
+                self._rubber_band.setGeometry(
+                    QtCore.QRect(self._draw_roi_origin, QtCore.QSize()))
+                self._rubber_band.show()
+            elif event.button() == QtCore.Qt.RightButton:
+                self._cancel_draw_roi()
+            return
+        # Delegate to existing pick-mode handler
+        self.on_main_label_clicked(event)
+
+    def _on_label_mouse_move(self, event):
+        """Resize rubber band during drag, constrained to square."""
+        if not self._draw_roi_mode or self._draw_roi_origin is None:
+            return
+        pos = event.position().toPoint()
+        dx = pos.x() - self._draw_roi_origin.x()
+        dy = pos.y() - self._draw_roi_origin.y()
+        # Constrain to square: use the smaller absolute extent
+        side = min(abs(dx), abs(dy))
+        if side == 0:
+            return
+        # Preserve drag direction
+        sx = side if dx >= 0 else -side
+        sy = side if dy >= 0 else -side
+        rect = QtCore.QRect(
+            self._draw_roi_origin,
+            QtCore.QPoint(self._draw_roi_origin.x() + sx,
+                          self._draw_roi_origin.y() + sy)).normalized()
+        self._rubber_band.setGeometry(rect)
+
+    def _on_label_mouse_release(self, event):
+        """Finalize ROI from rubber band rectangle."""
+        if not self._draw_roi_mode or self._draw_roi_origin is None:
+            return
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+
+        rect = self._rubber_band.geometry()
+        self._rubber_band.hide()
+        self._draw_roi_origin = None
+
+        result = self._widget_rect_to_sensor(rect)
+        if result is None:
+            self._show_status_message("Draw ROI: selection too small or outside image.", 3)
+            return
+
+        offset_x, offset_y, dim = result
+
+        # Update internal state and spinboxes without triggering signals
+        self.crop_size_spin.blockSignals(True)
+        self.crop_x_spin.blockSignals(True)
+        self.crop_y_spin.blockSignals(True)
+
+        self.dim_roi = dim
+        self.crop_x = offset_x
+        self.crop_y = offset_y
+
+        self.crop_size_spin.setValue(dim)
+        self.crop_x_spin.setValue(offset_x)
+        self.crop_y_spin.setValue(offset_y)
+
+        self.crop_size_spin.blockSignals(False)
+        self.crop_x_spin.blockSignals(False)
+        self.crop_y_spin.blockSignals(False)
+
+        # Enable crop and apply
+        self.crop_enabled = True
+        self.roi_crop_check.blockSignals(True)
+        self.roi_crop_check.setChecked(True)
+        self.roi_crop_check.blockSignals(False)
+        self._apply_camera_roi(dim, dim, offset_x, offset_y)
+
+        # Exit draw mode
+        self.draw_roi_btn.setChecked(False)
+
+        self._show_status_message(
+            f"ROI set: {dim}x{dim} at ({offset_x}, {offset_y})", 3)
+
+        # Trigger auto-calc if enabled
+        if self.auto_calc_check.isChecked():
+            self.calculate_all_theo()
+
+    def _widget_rect_to_sensor(self, rect):
+        """Convert a widget-space rectangle to sensor coordinates.
+
+        Returns (offset_x, offset_y, dim) or None if invalid.
+        """
+        pixmap = self.label.pixmap()
+        if not pixmap:
+            return None
+
+        label_size = self.label.size()
+        pm_size = pixmap.size()
+
+        # Padding from centering the pixmap in the label
+        pad_x = (label_size.width() - pm_size.width()) // 2
+        pad_y = (label_size.height() - pm_size.height()) // 2
+
+        # Widget coords -> pixmap coords
+        pm_left = rect.left() - pad_x
+        pm_top = rect.top() - pad_y
+        pm_right = rect.right() - pad_x
+        pm_bottom = rect.bottom() - pad_y
+
+        # When Fourier is inline (side-by-side), the camera image occupies
+        # only the left half of the pixmap.
+        if self.fourier_enabled and not self.fourier_detached:
+            cam_pm_w = pm_size.width() // 2
+        else:
+            cam_pm_w = pm_size.width()
+
+        # Clamp to camera portion of pixmap
+        pm_left = max(0, min(pm_left, cam_pm_w - 1))
+        pm_top = max(0, min(pm_top, pm_size.height() - 1))
+        pm_right = max(0, min(pm_right, cam_pm_w - 1))
+        pm_bottom = max(0, min(pm_bottom, pm_size.height() - 1))
+
+        if pm_right <= pm_left or pm_bottom <= pm_top:
+            return None
+
+        # Pixmap coords -> sensor coords
+        try:
+            sensor_w = self.node_map.WidthMax.value
+            sensor_h = self.node_map.HeightMax.value
+        except Exception:
+            sensor_w = self._sensor_w_max
+            sensor_h = self._sensor_h_max
+
+        scale_x = sensor_w / cam_pm_w
+        scale_y = sensor_h / pm_size.height()
+
+        s_left = pm_left * scale_x
+        s_top = pm_top * scale_y
+        s_right = pm_right * scale_x
+        s_bottom = pm_bottom * scale_y
+
+        s_w = s_right - s_left
+        s_h = s_bottom - s_top
+
+        # Square constraint
+        dim = int(min(s_w, s_h))
+        if dim < 64:
+            return None
+
+        offset_x = int(s_left)
+        offset_y = int(s_top)
+
+        # Snap to camera increments
+        w_inc = getattr(self.node_map.Width, 'inc', 64) or 64
+        ox_inc = getattr(self.node_map.OffsetX, 'inc', 64) or 64
+        oy_inc = getattr(self.node_map.OffsetY, 'inc', 64) or 64
+
+        dim = max(w_inc, (dim // w_inc) * w_inc)
+        offset_x = (offset_x // ox_inc) * ox_inc
+        offset_y = (offset_y // oy_inc) * oy_inc
+
+        # Clamp to sensor bounds
+        offset_x = max(0, min(offset_x, sensor_w - dim))
+        offset_y = max(0, min(offset_y, sensor_h - dim))
+
+        return (offset_x, offset_y, dim)
+
+    def _cancel_draw_roi(self):
+        """Cancel draw-ROI and restore previous state."""
+        if self._pre_draw_roi_state is not None:
+            crop_enabled, dim_roi, crop_x, crop_y = self._pre_draw_roi_state
+            self.dim_roi = dim_roi
+            self.crop_x = crop_x
+            self.crop_y = crop_y
+            self.crop_enabled = crop_enabled
+
+            self.crop_size_spin.blockSignals(True)
+            self.crop_x_spin.blockSignals(True)
+            self.crop_y_spin.blockSignals(True)
+            self.roi_crop_check.blockSignals(True)
+
+            self.crop_size_spin.setValue(dim_roi)
+            self.crop_x_spin.setValue(crop_x)
+            self.crop_y_spin.setValue(crop_y)
+            self.roi_crop_check.setChecked(crop_enabled)
+
+            self.crop_size_spin.blockSignals(False)
+            self.crop_x_spin.blockSignals(False)
+            self.crop_y_spin.blockSignals(False)
+            self.roi_crop_check.blockSignals(False)
+
+            if crop_enabled:
+                self._apply_camera_roi(dim_roi, dim_roi, crop_x, crop_y)
+            self._pre_draw_roi_state = None
+
+        # Exit draw mode
+        self.draw_roi_btn.setChecked(False)
+        self._show_status_message("Draw ROI cancelled.", 3)
+
+    def keyPressEvent(self, event):
+        """Handle Escape to cancel draw-ROI mode."""
+        if event.key() == QtCore.Qt.Key_Escape and self._draw_roi_mode:
+            self._cancel_draw_roi()
+            return
+        super().keyPressEvent(event)
 
     def on_main_label_clicked(self, event):
         """Map click on the right half of the side-by-side view to CX/CY."""
@@ -1272,8 +1668,9 @@ class CameraViewer(QtWidgets.QWidget):
 
         config_str = "config loaded" if self.config_loaded else "defaults"
         fft_str = " | Fourier on" if self.fourier_enabled else ""
+        fmt_str = self.pixel_format_combo.currentText()
         self.status_label.setText(
-            f"{model} | {self._current_fps:.1f} fps | {config_str}{fft_str}"
+            f"{model} | {fmt_str} | {self._current_fps:.1f} fps | {config_str}{fft_str}"
         )
 
     def _set_initial_size(self):
